@@ -1,10 +1,5 @@
 # blgo60
 
-Bingo, bangle, bungle, I'm so happy in the jungle, I refuse to go
-# doge-algol60
-
-![doge-algol](./doc/doge-algol60.png)
-
 Algol 60 compiler.
 
 ## Reference

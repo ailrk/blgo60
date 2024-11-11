@@ -2,6 +2,7 @@
 {-# HLINT ignore "Use <$>" #-}
 {-# HLINT ignore "Use module export list" #-}
 {-# HLINT ignore "Functor law" #-}
+{-# HLINT ignore "Redundant <$>" #-}
 {-# LANGUAGE OverloadedLabels #-}
 
 
@@ -9,7 +10,7 @@ module Parser where
 
 import Data.Text qualified as Text
 import Data.Set qualified as Set
-import Text.Megaparsec (ParsecT, MonadParsec (try), sepEndBy1, lookAhead, sepBy1, between, manyTill, sepBy, choice)
+import Text.Megaparsec (ParsecT, MonadParsec (try, getParserState), sepEndBy1, lookAhead, sepBy1, between, manyTill, sepBy, choice, manyTill_, anySingle, State (..))
 import Text.Megaparsec.Char (letterChar, alphaNumChar, space1, char)
 import Text.Megaparsec.Char.Lexer qualified as Lexer
 import Control.Monad.Combinators.Expr (Operator(..), makeExprParser)
@@ -20,6 +21,8 @@ import UnliftIO (MonadUnliftIO)
 import Prelude hiding (Type)
 import Control.Lens ((%~), _1, _2, (^.), (?~))
 import Data.Generics.Labels ()
+import Text.Megaparsec.Debug (dbg)
+import Text.Printf
 
 
 -- Algol60 BNF
@@ -69,14 +72,15 @@ type Parser m a = ParsecT Void Text m a
 
 type CanParse ctx m = (HasSymbolTable ctx, MonadReader ctx m, MonadUnliftIO m)
 
+
 lexeme :: Parser m a -> Parser m a
-lexeme = Lexer.lexeme whiteSpace
+lexeme = Lexer.lexeme ignore
 
 
 identifier :: CanParse ctx m => Parser m Symbol
-identifier = (lexeme . try) (p >>= check ) >>= lift . toSymbol
+identifier = (lexeme . try) (p >>= check) >>= lift . toSymbol
   where
-    p = Text.pack <$> ((:) <$> letterChar <*> many alphaNumChar)
+    p = Text.pack <$> ((:) <$> (letterChar <|> char '_') <*> many (alphaNumChar <|> char '_'))
     check x =
      if x `elem` reservedWords
      then fail $ "keyword " ++ show x ++ " cannot be an identifier"
@@ -104,8 +108,12 @@ stringLiteral =
   <*> getPosition
 
 
-whiteSpace :: Parser m ()
-whiteSpace = Lexer.space space1 empty (Lexer.skipBlockComment "comment" ";")
+blockComment :: Parser m ()
+blockComment = Lexer.skipBlockComment "comment" ";"
+
+
+ignore :: Parser m ()
+ignore = Lexer.space space1 empty blockComment
 
 
 commaSep :: CanParse ctx m => Parser m a -> Parser m [a]
@@ -117,7 +125,7 @@ commaSep1 p = sepBy1 p (symbol ",")
 
 
 symbol :: CanParse ctx m => Text -> Parser m Symbol
-symbol s = Lexer.symbol whiteSpace s >>= lift . toSymbol
+symbol s = Lexer.symbol ignore s >>= lift . toSymbol
 
 
 parens :: CanParse ctx m => Parser m a -> Parser m a
@@ -134,9 +142,9 @@ logicValue = BoolExpr <$> c <*> getPosition
     c = (symbol "true" *> pure True) <|> symbol "false" *> pure False
 
 
-
 label :: CanParse ctx m => Parser m Symbol
-label = identifier
+label = do
+  identifier
 
 
 switchIdentifier :: CanParse ctx m => Parser m Symbol
@@ -152,8 +160,7 @@ procedureIdentifier = identifier
 
 
 ifClause :: CanParse ctx m => Parser m Expr
-ifClause = do
-  symbol "if" *> booleanExpression <* symbol "then"
+ifClause = symbol "if" *> booleanExpression <* symbol "then"
 
 
 ----------------------------------------
@@ -292,18 +299,20 @@ designationalExpression = do
 
 
 simpleDesignationalExpression :: CanParse ctx m => Parser m Expr
-simpleDesignationalExpression =
-  try (LabelExpr <$> label <*> getPosition)
-  <|> try switchDesignator
-  <|> parens designationalExpression
+simpleDesignationalExpression = do
+  try switchDesignator <|> try labeled <|> parens designationalExpression
   where
-    switchDesignator = SwitchExpr <$> switchIdentifier *> parens subscriptExpression
+    labeled = LabelExpr <$> label <*> getPosition
+    switchDesignator =
+      SwitchExpr
+      <$> switchIdentifier
+      <*> brackets subscriptExpression
+      <*> getPosition
 
 
 actualParameter :: CanParse ctx m => Parser m Expr
 actualParameter = do
-  try stringLiteral
-  <|> try expression
+  try stringLiteral <|> try expression
 
 
 parameterDelimeter :: CanParse ctx m => Parser m ()
@@ -398,7 +407,7 @@ arrayDeclaration = ArrayDec <$> (try simple <|> full)
 
 
 switchList :: CanParse ctx m => Parser m [Expr]
-switchList = some designationalExpression
+switchList = commaSep1 designationalExpression
 
 
 switchDeclaration :: CanParse ctx m => Parser m Dec
@@ -490,15 +499,12 @@ procedureDeclaration = ProcedureDec <$> (try withType <|> withoutType)
 -- statements and blocks
 ----------------------------------------
 
-
 statement :: CanParse ctx m => Parser m Stmt
-statement =
-  try unconditionalStatement <|> try conditionalStatement <|> forStatement
+statement = try unconditionalStatement <|> try conditionalStatement <|> forStatement
 
 
 unconditionalStatement :: CanParse ctx m => Parser m Stmt
-unconditionalStatement = do
-  try basicStatement <|> try compoundStatement <|> block
+unconditionalStatement = try basicStatement <|> try compoundStatement <|> block
 
 
 unlabelledBasicStatement :: CanParse ctx m => Parser m Stmt
@@ -520,27 +526,28 @@ leftPart = do
 
 
 leftPartList :: CanParse ctx m => Parser m [Var]
-leftPartList = do
-  some (try leftPart)
+leftPartList = some (try leftPart)
 
 
 assignmentStatement :: CanParse ctx m => Parser m Stmt
-assignmentStatement = AssignStmt <$>
-  (AssignStmt_
-      <$> leftPartList
-      <*> (try arithmeticExpression <|> booleanExpression)
-      <*> getPosition)
+assignmentStatement = do
+  AssignStmt <$> st
+  where
+    st = AssignStmt_
+     <$> leftPartList
+     <*> (try arithmeticExpression <|> booleanExpression)
+     <*> getPosition
 
 
 gotoStatement :: CanParse ctx m => Parser m Stmt
-gotoStatement = do
- GotoStmt <$> (reserved "goto" *> designationalExpression)
+gotoStatement = GotoStmt <$> (reserved "goto" *> designationalExpression)
 
 
 procedureStatement :: CanParse ctx m => Parser m Stmt
-procedureStatement = CallStmt <$>
-  ( try (CallExpr <$> procedureIdentifier <*> actualParameterPart <*> getPosition)
-    <|> (CallExpr <$> procedureIdentifier <*> pure [] <*> getPosition))
+procedureStatement = CallStmt <$> (try withParams <|> withoutParams)
+  where
+    withParams = CallExpr <$> procedureIdentifier <*> actualParameterPart <*> getPosition
+    withoutParams = CallExpr <$> procedureIdentifier <*> pure [] <*> getPosition
 
 
 dummyStatement :: CanParse ctx m => Parser m Stmt
@@ -550,39 +557,42 @@ dummyStatement = do
 
 
 forListElement :: CanParse ctx m => Parser m ForListElement
-forListElement = do
-  try (Step <$> arithmeticExpression <* reserved "step" <*> arithmeticExpression <* reserved "until" <*> arithmeticExpression)
-  <|> try (While <$> arithmeticExpression <* reserved "while" <*> booleanExpression)
-  <|> (Immediate <$> arithmeticExpression)
+forListElement = try step <|> try while <|> imm
+  where
+    step = Step
+       <$> arithmeticExpression <* reserved "step"
+       <*> arithmeticExpression <* reserved "until"
+       <*> arithmeticExpression
+    while = While
+        <$> arithmeticExpression <* reserved "while"
+        <*> booleanExpression
+    imm = Immediate <$> arithmeticExpression
 
 
-forList :: CanParse ctx m => Parser m ()
-forList = commaSep1 forListElement *> pure ()
+forList :: CanParse ctx m => Parser m [ForListElement]
+forList = commaSep1 forListElement
 
 
-forClause :: CanParse ctx m => Parser m ()
-forClause = do
-  reserved "for"
-  *> variable
-  *> symbol ":="
-  *> forList
-  *> reserved "do"
+forClause :: CanParse ctx m => Parser m (Stmt -> Position -> ForStmt)
+forClause =
+  ForStmt_ <$> (reserved "for" *> variable) <*> (symbol ":=" *> forList) <* reserved "do"
 
 
 forStatement :: CanParse ctx m => Parser m Stmt
 forStatement = do
-  try (label *> symbol ":" *> forStatement) <|> (forClause *> statement)
+  try (LabelStmt <$> label <* symbol ":" *> forStatement)
+  <|> (ForStmt <$> (forClause <*> statement <*> getPosition))
 
 
 conditionalStatement :: CanParse ctx m => Parser m Stmt
 conditionalStatement = do
-  try (label *> symbol ":" *> conditionalStatement)
+  try (LabelStmt <$> label <* symbol ":" *> conditionalStatement)
   <|> conditionalStatement'
   where
-    conditionalStatement' = ifClause *>
-      (try forStatement
-       <|> try (unconditionalStatement *> reserved "else" *> statement)
-       <|> unconditionalStatement)
+    conditionalStatement' = IfStmt <$> (try ifFor <|> try ifElse <|> if')
+    ifFor = IfStmt_ <$> ifClause <*> forStatement <*> pure DummyStmt <*> getPosition
+    ifElse = IfStmt_ <$> ifClause <*> unconditionalStatement <* reserved "else" <*> statement <*> getPosition
+    if' = IfStmt_ <$> ifClause <*> unconditionalStatement <*> pure DummyStmt <*> getPosition
 
 
 ----------------------------------------
@@ -591,10 +601,19 @@ conditionalStatement = do
 
 
 compoundTail :: CanParse ctx m => Parser m Stmt
-compoundTail = do SeqStmt <$> statement <*> next
+compoundTail = do
+  SeqStmt <$> statement <*> next
   where
-    next = reserved "end" *> pure DummyStmt
+    next = do
+      reserved "end"
+      *> endComment
+      *> pure DummyStmt
       <|> symbol ";" *> compoundTail
+
+    endComment =
+      manyTill anySingle
+        (lookAhead . void $ (symbol ";" <|> symbol "end"))
+      *> pure ()
 
 
 blockHead :: CanParse ctx m => Parser m [Dec]
@@ -607,20 +626,20 @@ unlabeledCompoundStatement = reserved "begin" *> compoundTail
 
 
 unlabeledBlock :: CanParse ctx m => Parser m Stmt
-unlabeledBlock = do
-  blockHead *> compoundTail
+unlabeledBlock = BlockStmt <$> (BlockStmt_ <$> blockHead <*> compoundTail <*> getPosition)
 
 
 compoundStatement :: CanParse ctx m => Parser m Stmt
-compoundStatement = do
+compoundStatement =
   try (LabelStmt <$> label <* symbol ":" <*> compoundStatement)
   <|> unlabeledCompoundStatement
 
 
 block :: CanParse ctx m => Parser m Stmt
-block = do
+block =
   try (label *> symbol ":" *> block) <|> unlabeledBlock
 
 
 program :: CanParse ctx m => Parser m Stmt
-program = try block <|> compoundStatement
+program = ignore *> try block <|> compoundStatement
+

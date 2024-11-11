@@ -30,7 +30,15 @@ data Symbol = Symbol
   { text :: Text
   , hash :: Int
   }
-  deriving (Show, Read, Eq, Ord)
+  deriving (Show, Read)
+
+
+instance Eq Symbol where
+  a == b = a.hash == b.hash
+
+
+instance Ord Symbol where
+  compare a b = compare a.hash b.hash
 
 
 newSymbolTable :: SymbolTable

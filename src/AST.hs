@@ -282,11 +282,11 @@ data UnaryOp
 
 
 data ProcedureDec = ProcedureDec_
-  { name :: Symbol
+  { name       :: Symbol
   , parameters :: [Parameter]
   , returnType :: Maybe Type
-  , body :: Stmt
-  , position :: Position
+  , body       :: Stmt
+  , position   :: Position
   }
   deriving (Show, Read, Eq, Generic)
 
